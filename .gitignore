@@ -4,6 +4,9 @@ data/raw/
 *.h5ad
 *.h5
 
+# keep gene signatures (small json)
+!data/processed/gene_signatures.json
+
 # python
 __pycache__/
 *.py[cod]
