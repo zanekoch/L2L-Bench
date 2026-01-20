@@ -1,6 +1,7 @@
 # data files (large)
 data/processed/*.parquet
 data/raw/
+data/external/
 *.h5ad
 *.h5
 

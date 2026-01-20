@@ -11,6 +11,7 @@ dependencies = [
     "huggingface_hub>=0.20.0",
     "jupyter>=1.0.0",
     "ipykernel>=6.0.0",
+    "openpyxl>=3.1.5",
 ]
 
 [dependency-groups]
