@@ -1,0 +1,11 @@
+# data loading and processing
+datasets>=2.14.0
+pandas>=2.0.0
+pyarrow>=14.0.0
+dask[dataframe]>=2024.1.0
+
+# for working with HuggingFace
+huggingface_hub>=0.20.0
+
+# optional: for faster parquet reading
+fastparquet>=2024.2.0
