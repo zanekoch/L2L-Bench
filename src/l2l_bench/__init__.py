@@ -14,6 +14,7 @@ from l2l_bench.l2l_data import (
     Drug,
 )
 from l2l_bench.pathway_enrichment import PathwayEnrichment
+from l2l_bench.question import Question, TestItem
 
 __all__ = [
     "L2LData",
@@ -22,4 +23,6 @@ __all__ = [
     "CellLine",
     "Drug",
     "PathwayEnrichment",
+    "Question",
+    "TestItem",
 ]

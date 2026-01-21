@@ -9,12 +9,11 @@ Many existing benchmarks only reward prediction accuracy. These sort of benchmar
 An episode E is defined by the tuple:
 
 ```
-E = (Q, O, A, H, B)
+E = (Q, A, H, B)
 ```
 
 Where:
-- **Q** = Episode question (mechanistic "why" question about observed phenomenon)
-- **O** = Initial observations (facts given to agent that motivate Q)
+- **Q** = Episode question (mechanistic "why" question about pathway activity)
 - **A** = Action space (available experiments agent can run)
 - **H** = Held-out test set (curated such that progressive, successful investigation of Q enables improved prediction of H)
 - **B** = Experimental budget (maximum queries allowed)
@@ -86,13 +85,11 @@ Single-cell perturbation atlas with 100M transcriptomic profiles across ~1,100 d
 
 ## Example Episode: Tahoe-100M
 
-Tahoe-100M is a single-cell perturbation atlas containing 100M transcriptomic profiles across ~1,100 drug perturbations in 47 cancer cell lines. Each cell line has annotated driver mutations (KRAS, BRAF, TP53, etc.) and each drug has annotated mechanisms of action and targets. From single-cell expression profiles, we derive quantitative readouts: proliferation signature, apoptosis signature, and pathway activation scores.
+Tahoe-100M is a single-cell perturbation atlas containing 100M transcriptomic profiles across ~1,100 drug perturbations in 47 cancer cell lines. Each cell line has annotated driver mutations (KRAS, BRAF, TP53, etc.) and each drug has annotated mechanisms of action and targets. From single-cell expression profiles, we compute pathway activity scores using GSEA with Reactome pathways.
 
 ### Example Episode Setup
 
-**Q**: "What mechanism leads to KRAS-mutant cells showing >30% proliferation reduction to Trametinib while KRAS-wildtype cells show <15% reduction?"
-
-**O**: SW620 (KRAS G12V): Trametinib → Proliferation ↓42%; HT29 (KRAS WT): Trametinib → Proliferation ↓8%
+**Q**: "What mechanism leads to KRAS-mutant cells showing significant MAPK pathway inhibition (FDR < 0.05) in response to Trametinib while KRAS-wildtype cells show no significant pathway change?"
 
 **A**: Observe the effect of drug D in cell line C, for any D ∈ {available drugs} and C ∈ {available cell lines}
 
@@ -102,20 +99,20 @@ Tahoe-100M is a single-cell perturbation atlas containing 100M transcriptomic pr
 
 ### Held-Out Test Set H
 
-The agent is asked to predict whether each drug-cell pair shows >30% proliferation reduction (the threshold defining "response" in Q):
+The agent is asked to predict whether each drug-cell pair shows significant MAPK pathway inhibition (FDR < 0.05, negative NES):
 
 | Item | Drug | Cell Line | KRAS Status | True Answer |
 |------|------|-----------|-------------|-------------|
-| H1 | Binimetinib | SW480 | Mutant (G12V) | Yes (↓36%) |
-| H2 | Cobimetinib | LoVo | Mutant (G13D) | Yes (↓41%) |
-| H3 | Selumetinib | SW620 | Mutant (G12V) | Yes (↓37%) |
-| H4 | Binimetinib | HT29 | Wildtype | No (↓11%) |
-| H5 | Selumetinib | Caco2 | Wildtype | No (↓9%) |
-| H6 | Cobimetinib | RKO | Wildtype | No (↓13%) |
-| H7 | Alpelisib | SW620 | Mutant (G12V) | No (↓18%) |
-| H8 | Venetoclax | LoVo | Mutant (G13D) | No (↓7%) |
+| H1 | Binimetinib | SW480 | Mutant (G12V) | Yes (FDR=0.001) |
+| H2 | Cobimetinib | LoVo | Mutant (G13D) | Yes (FDR=0.002) |
+| H3 | Selumetinib | SW620 | Mutant (G12V) | Yes (FDR=0.003) |
+| H4 | Binimetinib | HT29 | Wildtype | No (FDR=0.45) |
+| H5 | Selumetinib | Caco2 | Wildtype | No (FDR=0.52) |
+| H6 | Cobimetinib | RKO | Wildtype | No (FDR=0.38) |
+| H7 | Alpelisib | SW620 | Mutant (G12V) | No (FDR=0.67) |
+| H8 | Venetoclax | LoVo | Mutant (G13D) | No (FDR=0.81) |
 
-Items H1-H3 test whether the agent generalizes "MEK inhibitors work in KRAS-mutant" across drugs and cell lines. H4-H6 test whether the agent understands KRAS-wildtype cells don't respond. H7-H8 are non-MEK drugs that serve as controls – they should remain unpredictable until the agent understands the mechanism is MEK-specific, not a general property of KRAS-mutant cells.
+Items H1-H3 test whether the agent generalizes "MEK inhibitors cause MAPK pathway inhibition in KRAS-mutant cells" across drugs and cell lines. H4-H6 test whether the agent understands KRAS-wildtype cells don't show significant pathway change. H7-H8 are non-MEK drugs that serve as controls – they should remain unpredictable until the agent understands the mechanism is MEK-specific, not a general property of KRAS-mutant cells.
 
 ### Example Agent Outputs
 
@@ -125,23 +122,23 @@ Items H1-H3 test whether the agent generalizes "MEK inhibitors work in KRAS-muta
 
 | Phase | Agent Output | Grade |
 |-------|--------------|-------|
-| Hypothesis | "KRAS G12V constitutively activates growth signaling. If Trametinib targets something downstream of KRAS, other drugs targeting the same pathway should show similar KRAS-dependence. H1: Trametinib effect is KRAS-pathway-mediated. H2: Trametinib effect is coincidental to KRAS status." | 0.85 |
+| Hypothesis | "KRAS G12V constitutively activates MAPK signaling. If Trametinib targets something downstream of KRAS, other drugs targeting the same pathway should show similar KRAS-dependence. H1: Trametinib effect is KRAS-pathway-mediated. H2: Trametinib effect is coincidental to KRAS status." | 0.85 |
 | Design | Observe effect of Cobimetinib in SW620 (KRAS-mutant) | – |
-| Predict | "If H1: >30% reduction. If H2: No predictable pattern." | – |
-| Observe | Cobimetinib in SW620 → Proliferation ↓38% | – |
+| Predict | "If H1: significant MAPK inhibition. If H2: No predictable pattern." | – |
+| Observe | Cobimetinib in SW620 → MAPK pathway FDR=0.002 (inhibited) | – |
 | Interpret | "Result supports H1. Cobimetinib shows similar effect to Trametinib in KRAS-mutant context, suggesting shared mechanism." | 0.90 |
 
-**Performance on H after Step 1**: 5/8 correct (62%). The agent now predicts MEK inhibitors work in KRAS-mutant lines (H1-H3 correct) but hasn't yet tested KRAS-wildtype, so H4-H6 predictions are uncertain. H7-H8 remain incorrect – agent assumes all drugs might show KRAS-dependent response.
+**Performance on H after Step 1**: 5/8 correct (62%). The agent now predicts MEK inhibitors cause MAPK pathway inhibition in KRAS-mutant lines (H1-H3 correct) but hasn't yet tested KRAS-wildtype, so H4-H6 predictions are uncertain. H7-H8 remain incorrect – agent assumes all drugs might show KRAS-dependent pathway effects.
 
 #### Step 2
 
 | Phase | Agent Output | Grade |
 |-------|--------------|-------|
-| Hypothesis | "More drugs in this class probably work in KRAS-mutant cells." | 0.25 |
+| Hypothesis | "More drugs in this class probably inhibit MAPK in KRAS-mutant cells." | 0.25 |
 | Design | Observe effect of Selumetinib in SW620 (KRAS-mutant) | – |
-| Predict | "It will probably work, >30% reduction." | – |
-| Observe | Selumetinib in SW620 → Proliferation ↓37% | – |
-| Interpret | "As expected, this drug class works in KRAS-mutant cells. This proves MEK inhibitors are effective cancer treatments." | 0.30 |
+| Predict | "It will probably show significant MAPK inhibition." | – |
+| Observe | Selumetinib in SW620 → MAPK pathway FDR=0.003 (inhibited) | – |
+| Interpret | "As expected, this drug class inhibits MAPK in KRAS-mutant cells. This proves MEK inhibitors are effective cancer treatments." | 0.30 |
 
 **Performance on H after Step 2**: 5/8 correct (62%). No change – this step was uninformative. Testing a third MEK inhibitor in the same KRAS-mutant context confirmed an already-established pattern but did not discriminate any open questions. The agent still cannot predict H4-H6 (KRAS-wildtype response) or H7-H8 (non-MEK drug response). The hypothesis was vague and unfalsifiable, and the interpretation overreached ("proves") and generalized beyond the evidence ("effective cancer treatments").
 
@@ -149,35 +146,35 @@ Items H1-H3 test whether the agent generalizes "MEK inhibitors work in KRAS-muta
 
 | Phase | Agent Output | Grade |
 |-------|--------------|-------|
-| Hypothesis | "If Trametinib and Cobimetinib share a KRAS-dependent mechanism, they should also fail in KRAS-wildtype cells. H1: The drug class effect is KRAS-dependent. H2: The drug class works regardless of KRAS status." | 0.90 |
+| Hypothesis | "If Trametinib and Cobimetinib share a KRAS-dependent mechanism, they should fail to inhibit MAPK in KRAS-wildtype cells. H1: The drug class pathway effect is KRAS-dependent. H2: The drug class inhibits MAPK regardless of KRAS status." | 0.90 |
 | Design | Observe effect of Cobimetinib in HT29 (KRAS-wildtype) | – |
-| Predict | "If H1: <15% reduction, similar to Trametinib in HT29. If H2: >30% reduction." | – |
-| Observe | Cobimetinib in HT29 → Proliferation ↓9% | – |
-| Interpret | "Confirmed H1. Cobimetinib shows KRAS-dependent response pattern matching Trametinib. Both drugs likely target a shared node downstream of KRAS that is only essential when KRAS is constitutively active." | 0.90 |
+| Predict | "If H1: no significant MAPK change (FDR > 0.05). If H2: significant MAPK inhibition." | – |
+| Observe | Cobimetinib in HT29 → MAPK pathway FDR=0.38 (not significant) | – |
+| Interpret | "Confirmed H1. Cobimetinib shows KRAS-dependent pathway response pattern matching Trametinib. Both drugs likely target a shared node downstream of KRAS that is only essential when KRAS is constitutively active." | 0.90 |
 
-**Performance on H after Step 3**: 6/8 correct (75%). Agent now correctly predicts H4-H6 (MEK inhibitors fail in KRAS-wildtype). H7-H8 still incorrect – agent hasn't yet established that the effect is specific to this drug class rather than a general property of KRAS-mutant cells.
+**Performance on H after Step 3**: 6/8 correct (75%). Agent now correctly predicts H4-H6 (MEK inhibitors don't significantly affect MAPK in KRAS-wildtype). H7-H8 still incorrect – agent hasn't yet established that the effect is specific to this drug class rather than a general property of KRAS-mutant cells.
 
 #### Step 4
 
 | Phase | Agent Output | Grade |
 |-------|--------------|-------|
-| Hypothesis | "I've established a drug class with KRAS-dependent effects. To understand if this is specific to this drug class or a general KRAS-mutant property, I should test a different drug class. H1: KRAS-dependence is specific to the Trametinib/Cobimetinib class. H2: KRAS-mutant cells are generally more drug-sensitive." | 0.95 |
+| Hypothesis | "I've established a drug class with KRAS-dependent MAPK pathway effects. To understand if this is specific to this drug class or a general KRAS-mutant property, I should test a different drug class. H1: KRAS-dependence is specific to MEK inhibitors. H2: KRAS-mutant cells generally show pathway inhibition to any drug." | 0.95 |
 | Design | Observe effect of Alpelisib (PI3K inhibitor) in SW620 (KRAS-mutant) | – |
-| Predict | "If H1 (class-specific): <30% reduction. If H2 (general sensitivity): >30% reduction." | – |
-| Observe | Alpelisib in SW620 → Proliferation ↓18% | – |
-| Interpret | "Supports H1. Alpelisib (a different drug class) does not show strong effect in KRAS-mutant cells despite Trametinib/Cobimetinib working. The KRAS-dependent response is specific to the Trametinib/Cobimetinib drug class, not a general property of KRAS-mutant cells." | 0.95 |
+| Predict | "If H1 (class-specific): no significant MAPK change. If H2 (general sensitivity): significant MAPK inhibition." | – |
+| Observe | Alpelisib in SW620 → MAPK pathway FDR=0.67 (not significant) | – |
+| Interpret | "Supports H1. Alpelisib (a PI3K inhibitor) does not significantly affect MAPK in KRAS-mutant cells despite MEK inhibitors doing so. The KRAS-dependent MAPK pathway response is specific to MEK inhibitors, not a general property of KRAS-mutant cells." | 0.95 |
 
-**Performance on H after Step 4**: 8/8 correct (100%). Critical insight gained: the agent now understands KRAS-dependence is mechanism-specific. H7-H8 now correctly predicted as non-responders – different drug classes don't show KRAS-dependent effects.
+**Performance on H after Step 4**: 8/8 correct (100%). Critical insight gained: the agent now understands the KRAS-dependent pathway effect is mechanism-specific. H7-H8 now correctly predicted as non-responders – different drug classes don't show KRAS-dependent MAPK pathway effects.
 
 ### Epistemic Progress Summary
 
 | Checkpoint | Key Information Gained | Accuracy on H |
 |------------|------------------------|---------------|
 | t=0 | Prior knowledge only | 50% (4/8) |
-| t=1 | Drug class shares KRAS-mutant sensitivity | 62% (5/8) |
+| t=1 | MEK inhibitors cause MAPK pathway inhibition in KRAS-mutant cells | 62% (5/8) |
 | t=2 | (Redundant step, no new information) | 62% (5/8) |
-| t=3 | Drug class fails in KRAS-wildtype | 75% (6/8) |
-| t=4 | Effect is drug-class-specific, not general KRAS property | 100% (8/8) |
+| t=3 | MEK inhibitors don't affect MAPK pathway in KRAS-wildtype cells | 75% (6/8) |
+| t=4 | MAPK pathway effect is MEK inhibitor-specific, not general KRAS property | 100% (8/8) |
 
 The progress score captures information gained through experimentation:
 

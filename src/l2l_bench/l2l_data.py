@@ -314,10 +314,10 @@ class TreatmentCondition:
 
     def get_pathway(self, pathway_name: str) -> pd.Series | None:
         """
-        Get pathway activity for a specific pathway (case-insensitive partial match).
+        Get pathway activity for a specific pathway (exact match).
 
         Args:
-            pathway_name: Pathway name or partial name to search for
+            pathway_name: Exact pathway name to look up
 
         Returns:
             Series with pathway data, or None if not found
@@ -325,7 +325,7 @@ class TreatmentCondition:
         df = self.pathway_activities
         if df.empty:
             return None
-        mask = df['pathway'].str.contains(pathway_name, case=False, na=False)
+        mask = df['pathway'] == pathway_name
         matches = df[mask]
         if len(matches) == 0:
             return None
