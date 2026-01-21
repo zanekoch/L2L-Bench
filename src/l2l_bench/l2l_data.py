@@ -7,15 +7,24 @@ avoiding the need to download the full 50GB+ dataset.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import duckdb
 import pandas as pd
-from datasets import load_dataset
+from datasets import load_dataset # huggingface datasets library
 
 
-INDEX_PATH = Path("data/processed/treatment_index.parquet")
+def _get_root_dir() -> Path:
+    """Get the project root directory from L2L_ROOT_DIR env var or default to cwd."""
+    root = os.environ.get("L2L_ROOT_DIR")
+    if root:
+        return Path(root)
+    return Path.cwd()
+
+
+INDEX_PATH = _get_root_dir() / "data/processed/treatment_index.parquet"
 
 
 @dataclass
@@ -80,6 +89,18 @@ class L2LData:
         # set a reasonable timeout and retry settings
         self._conn.execute("SET http_timeout=30000;")  # 30 seconds
 
+        # configure HuggingFace authentication if token available
+        hf_token = os.environ.get("HF_TOKEN")
+        if hf_token:
+            # use DuckDB's Secrets Manager for HTTP authentication
+            self._conn.execute(f"""
+                CREATE SECRET hf_auth (
+                    TYPE http,
+                    BEARER_TOKEN '{hf_token}'
+                );
+            """)
+            print("HuggingFace authentication configured")
+
     def _get_parquet_urls(self) -> list[str]:
         """Get list of parquet file URLs for the pseudobulk DE data."""
         # there are 1026 parquet files for the DE data
@@ -126,8 +147,8 @@ class L2LData:
         print(f"  Sample metadata: {len(self._sample_metadata)} samples")
 
         # build lookup caches
-        self._valid_drugs = set(self._drug_metadata['drug'].unique())
-        self._valid_cell_lines = set(self._cell_line_metadata['cell_name'].unique())
+        self._valid_drugs = set[str](self._drug_metadata['drug'].unique())
+        self._valid_cell_lines = set[str](self._cell_line_metadata['cell_name'].unique())
 
         print("Metadata loaded successfully.")
 
@@ -356,57 +377,184 @@ class L2LData:
         base_url = f"https://huggingface.co/datasets/{self.dataset_path}/resolve/main/metadata/{self.de_config}"
         return f"{base_url}/train-{file_num:05d}-of-01026.parquet"
 
-    def build_treatment_index(self, save_path: Path | None = None) -> pd.DataFrame:
+    def build_treatment_index(
+        self,
+        save_path: Path | None = None,
+        compute_pathways: bool = False,
+    ) -> pd.DataFrame:
         """
-        Build index mapping treatments to file numbers by streaming through data.
+        Build index mapping treatments to file numbers using DuckDB.
 
-        This is slow (~30-60 min) but only needs to be done once.
+        Queries SELECT DISTINCT from each parquet file individually.
+        Takes ~3-6 hours (10-20 sec per file × 1026 files).
+
+        When compute_pathways=True, also computes GSEA pathway enrichment for each
+        treatment while processing each file. This avoids a second pass through all
+        files but significantly increases processing time per file (~10-30 min/file).
+
+        Writes incrementally to disk and can resume from where it left off.
         The index is saved to data/processed/treatment_index.parquet.
+
+        Args:
+            save_path: Path to save the index. Defaults to INDEX_PATH.
+            compute_pathways: If True, compute GSEA pathway enrichment for each
+                treatment while processing. Results are cached to
+                data/processed/reactome/ and already-cached treatments are skipped.
 
         Returns:
             DataFrame with columns: cell_line, drug, concentration, file_num
         """
+        import time
+
         if save_path is None:
             save_path = INDEX_PATH
 
-        print("Building treatment index (this takes 30-60 minutes, but only once)...")
+        n_files = 1026
 
-        de_stream = load_dataset(
-            self.dataset_path,
-            name=self.de_config,
-            split="train",
-            streaming=True
+        # initialize PathwayEnrichment if computing pathways
+        pe = None
+        if compute_pathways:
+            from l2l_bench.pathway_enrichment import PathwayEnrichment
+            pe = PathwayEnrichment(self)
+            print("Pathway enrichment enabled - will compute GSEA for each treatment")
+
+        # check for existing partial index to resume from
+        start_file = 0
+        all_treatments = []
+        if save_path.exists():
+            existing_df = pd.read_parquet(save_path)
+            if 'file_num' in existing_df.columns:
+                start_file = existing_df['file_num'].max() + 1
+                all_treatments.append(existing_df)
+                print(f"Resuming from file {start_file} (found {len(existing_df)} existing treatments)")
+
+        if start_file >= n_files:
+            print("Index already complete!")
+            return existing_df
+
+        print(f"Building treatment index via DuckDB ({n_files} files)...")
+        if start_file == 0 and not compute_pathways:
+            print("Estimated time: 3-6 hours (10-20 sec per file)")
+
+        start_time = time.time()
+        files_processed = 0
+        pathways_computed = 0
+        pathways_skipped = 0
+
+        for file_num in range(start_file, n_files):
+            file_start = time.time()
+            url = self._get_single_parquet_url(file_num)
+
+            try:
+                # compute pathways if enabled
+                file_pathways_computed = 0
+                file_pathways_skipped = 0
+
+                if compute_pathways and pe is not None:
+                    # load only columns needed for index + GSEA
+                    # index: Cell_Name_Vevo, drug, concentration
+                    # GSEA: gene_name, log2FoldChange, padj
+                    query = f"""
+                        SELECT Cell_Name_Vevo, drug, concentration,
+                               gene_name, log2FoldChange, padj
+                        FROM read_parquet('{url}')
+                    """
+                    full_de = self._conn.execute(query).df()
+
+                    # extract distinct treatments from loaded data (no second download)
+                    df = full_de[['Cell_Name_Vevo', 'drug', 'concentration']].drop_duplicates()
+                    df = df.rename(columns={'Cell_Name_Vevo': 'cell_line'})
+                    df['file_num'] = file_num
+                    all_treatments.append(df)
+                    files_processed += 1
+
+                    # process each treatment in the file
+                    for (cell_line, drug, conc), treatment_df in full_de.groupby(
+                        ['Cell_Name_Vevo', 'drug', 'concentration']
+                    ):
+                        # skip if already cached
+                        if pe._is_cached(drug, conc, cell_line):
+                            file_pathways_skipped += 1
+                            continue
+
+                        try:
+                            pe.compute_enrichment_from_df(
+                                de_data=treatment_df,
+                                drug=drug,
+                                concentration=conc,
+                                cell_line=cell_line,
+                                verbose=False,  # reduce noise during batch processing
+                            )
+                            file_pathways_computed += 1
+                        except Exception as e:
+                            print(f"    Warning: Failed pathway for {drug}@{conc} in {cell_line}: {e}")
+
+                    pathways_computed += file_pathways_computed
+                    pathways_skipped += file_pathways_skipped
+                else:
+                    # index-only mode: just get distinct treatments
+                    query = f"""
+                        SELECT DISTINCT
+                            Cell_Name_Vevo as cell_line,
+                            drug,
+                            concentration
+                        FROM read_parquet('{url}')
+                    """
+                    df = self._conn.execute(query).df()
+                    df['file_num'] = file_num
+                    all_treatments.append(df)
+                    files_processed += 1
+
+                file_elapsed = time.time() - file_start
+                total_elapsed = time.time() - start_time
+                avg_per_file = total_elapsed / files_processed
+                remaining_files = n_files - file_num - 1
+                eta_sec = avg_per_file * remaining_files
+
+                # build progress message
+                progress_msg = (
+                    f"  File {file_num + 1:4d}/{n_files} | "
+                    f"{len(df):5d} treatments | "
+                    f"{file_elapsed:5.1f}s | "
+                    f"ETA: {eta_sec/3600:.1f}h"
+                )
+                if compute_pathways:
+                    progress_msg += f" | pathways: {file_pathways_computed} new, {file_pathways_skipped} cached"
+                print(progress_msg)
+
+                # save incrementally after every file
+                self._save_treatment_index(all_treatments, save_path)
+
+            except Exception as e:
+                print(f"  File {file_num + 1:4d}/{n_files} | ERROR: {e}")
+                # save what we have before continuing
+                if all_treatments:
+                    self._save_treatment_index(all_treatments, save_path)
+                continue
+
+        # final save
+        index_df = self._save_treatment_index(all_treatments, save_path)
+
+        total_elapsed = time.time() - start_time
+        print(f"\nDone! Processed {files_processed} files in {total_elapsed/3600:.1f} hours")
+        print(f"Saved {len(index_df)} unique treatments to {save_path}")
+        if compute_pathways:
+            print(f"Pathways: {pathways_computed} computed, {pathways_skipped} already cached")
+
+        return index_df
+
+    def _save_treatment_index(self, all_treatments: list[pd.DataFrame], save_path: Path) -> pd.DataFrame:
+        """Combine and save treatment index, deduplicating entries."""
+        index_df = pd.concat(all_treatments, ignore_index=True)
+
+        # deduplicate - same treatment may appear in multiple files, keep first
+        index_df = index_df.drop_duplicates(
+            subset=['cell_line', 'drug', 'concentration'],
+            keep='first'
         )
 
-        # track which file we're in based on row count
-        # ~4M rows per file
-        ROWS_PER_FILE = 4_000_000
-
-        treatments = []
-        seen = set()
-
-        for i, row in enumerate(de_stream):
-            key = (row['Cell_Name_Vevo'], row['drug'], row['concentration'])
-
-            if key not in seen:
-                seen.add(key)
-                file_num = i // ROWS_PER_FILE
-                treatments.append({
-                    'cell_line': row['Cell_Name_Vevo'],
-                    'drug': row['drug'],
-                    'concentration': row['concentration'],
-                    'file_num': file_num,
-                    'row_start': i,
-                })
-
-                if len(treatments) % 100 == 0:
-                    print(f"  Found {len(treatments)} treatments...")
-
-        index_df = pd.DataFrame(treatments)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         index_df.to_parquet(save_path, index=False)
-        print(f"Saved treatment index with {len(index_df)} treatments to {save_path}")
-
         return index_df
 
     def load_treatment_index(self) -> pd.DataFrame:

@@ -11,7 +11,7 @@ import gseapy as gp
 import numpy as np
 import pandas as pd
 
-from l2l_bench.l2l_data import L2LData
+from l2l_bench.l2l_data import L2LData, _get_root_dir
 
 
 @dataclass
@@ -25,7 +25,7 @@ class PathwayEnrichment:
     """
 
     data: L2LData
-    cache_dir: Path = field(default_factory=lambda: Path("data/processed/reactome"))
+    cache_dir: Path = field(default_factory=lambda: _get_root_dir() / "data/processed/reactome")
     gene_set_library: str = "Reactome_2022"
     min_size: int = 15
     max_size: int = 500
@@ -54,39 +54,37 @@ class PathwayEnrichment:
         """Save enrichment results to cache."""
         df.to_parquet(self._get_cache_path(drug, concentration, cell_line), index=False)
 
-    def compute_enrichment(
+    def compute_enrichment_from_df(
         self,
+        de_data: pd.DataFrame,
         drug: str,
         concentration: float,
         cell_line: str,
         force_recompute: bool = False,
+        verbose: bool = True,
     ) -> pd.DataFrame:
         """
-        Compute Reactome pathway enrichment for a treatment condition.
+        Compute Reactome pathway enrichment from pre-loaded DataFrame.
 
-        Uses GSEApy prerank with sign(logFC) * -log10(padj) as ranking metric.
-        Results are cached to avoid recomputation.
+        This method avoids re-downloading data when DE data is already loaded,
+        useful for single-pass processing during index building.
 
         Args:
+            de_data: DataFrame with columns gene_name, log2FoldChange, padj
             drug: Drug name
             concentration: Drug concentration
             cell_line: Cell line name
             force_recompute: If True, recompute even if cached
+            verbose: If True, print progress messages
 
         Returns:
             DataFrame with columns: pathway, nes, pvalue, fdr, leading_edge
         """
         # check cache first
         if not force_recompute and self._is_cached(drug, concentration, cell_line):
-            print(f"Loading cached enrichment for {drug}@{concentration} in {cell_line}")
+            if verbose:
+                print(f"Loading cached enrichment for {drug}@{concentration} in {cell_line}")
             return self._load_cached(drug, concentration, cell_line)
-
-        # get differential expression data (uses indexed single-file download)
-        de_data = self.data.get_expression_data_indexed(
-            drug=drug,
-            concentration=concentration,
-            cell_line=cell_line
-        )
 
         if len(de_data) == 0:
             raise ValueError(f"No expression data found for {drug}@{concentration} in {cell_line}")
@@ -113,8 +111,9 @@ class PathwayEnrichment:
         ranked = ranked.drop_duplicates(subset='gene_name')
         ranked = ranked.set_index('gene_name')['rank_metric']
 
-        print(f"Running prerank enrichment for {drug}@{concentration} in {cell_line}...")
-        print(f"  {len(ranked)} genes in ranked list (filtered {filtered_count} without official symbols)")
+        if verbose:
+            print(f"Running prerank enrichment for {drug}@{concentration} in {cell_line}...")
+            print(f"  {len(ranked)} genes in ranked list (filtered {filtered_count} without official symbols)")
 
         # run GSEApy prerank
         pre_res = gp.prerank(
@@ -150,9 +149,54 @@ class PathwayEnrichment:
 
         # cache results
         self._save_cache(results, drug, concentration, cell_line)
-        print(f"  Cached {len(results)} pathway scores")
+        if verbose:
+            print(f"  Cached {len(results)} pathway scores")
 
         return results
+
+    def compute_enrichment(
+        self,
+        drug: str,
+        concentration: float,
+        cell_line: str,
+        force_recompute: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Compute Reactome pathway enrichment for a treatment condition.
+
+        Uses GSEApy prerank with sign(logFC) * -log10(padj) as ranking metric.
+        Results are cached to avoid recomputation.
+
+        Args:
+            drug: Drug name
+            concentration: Drug concentration
+            cell_line: Cell line name
+            force_recompute: If True, recompute even if cached
+
+        Returns:
+            DataFrame with columns: pathway, nes, pvalue, fdr, leading_edge
+        """
+        # check cache first (avoids downloading if already cached)
+        if not force_recompute and self._is_cached(drug, concentration, cell_line):
+            print(f"Loading cached enrichment for {drug}@{concentration} in {cell_line}")
+            return self._load_cached(drug, concentration, cell_line)
+
+        # get differential expression data (uses indexed single-file download)
+        de_data = self.data.get_expression_data_indexed(
+            drug=drug,
+            concentration=concentration,
+            cell_line=cell_line
+        )
+
+        # delegate to compute_enrichment_from_df
+        return self.compute_enrichment_from_df(
+            de_data=de_data,
+            drug=drug,
+            concentration=concentration,
+            cell_line=cell_line,
+            force_recompute=True,  # we already checked cache above
+            verbose=True,
+        )
 
     def get_pathway_score(
         self,
