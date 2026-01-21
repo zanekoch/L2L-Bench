@@ -25,6 +25,54 @@ def _get_root_dir() -> Path:
 
 
 INDEX_PATH = _get_root_dir() / "data/processed/treatment_index.parquet"
+REACTOME_CACHE_DIR = _get_root_dir() / "data/processed/reactome"
+
+
+@dataclass
+class DriverMutation:
+    """Represents a driver mutation in a cell line."""
+
+    gene_symbol: str
+    protein_effect: str | None  # e.g., "p.G12V", "DEL"
+    var_type: str               # Missense, Frameshift, Stopgain, Deletion, etc.
+    var_zygosity: str | None    # "Het" or "Hom"
+    mechanism: str | None       # "LoF" or "GoF"
+    gene_type: str              # "Suppressor" or "Oncogene"
+
+
+@dataclass
+class CellLine:
+    """Represents a cell line with its driver mutations and metadata."""
+
+    name: str
+    organ: str                           # tissue of origin
+    driver_mutations: list[DriverMutation]
+
+    def has_mutation(self, gene: str) -> bool:
+        """Check if the cell line has a mutation in the given gene."""
+        return any(m.gene_symbol == gene for m in self.driver_mutations)
+
+    def get_oncogenes(self) -> list[DriverMutation]:
+        """Get all oncogene mutations."""
+        return [m for m in self.driver_mutations if m.gene_type == "Oncogene"]
+
+    def get_tumor_suppressors(self) -> list[DriverMutation]:
+        """Get all tumor suppressor mutations."""
+        return [m for m in self.driver_mutations if m.gene_type == "Suppressor"]
+
+
+@dataclass
+class Drug:
+    """Represents a drug with its mechanism of action and targets."""
+
+    name: str
+    targets: list[str] | None
+    moa_broad: str              # inhibitor/antagonist, activator/agonist, unclear
+    moa_fine: str               # MEK inhibitor, PI3K/AKT inhibitor, etc.
+    human_approved: bool
+    clinical_trials: bool
+    canonical_smiles: str | None  # SMILES chemical structure
+    pubchem_cid: int | None       # PubChem compound ID
 
 
 def _process_file_batch(batch_info: dict) -> dict:
@@ -210,15 +258,125 @@ def _process_file_batch(batch_info: dict) -> dict:
 
 @dataclass
 class TreatmentCondition:
-    """Represents a specific treatment condition (drug + concentration + cell line)."""
+    """
+    Represents a specific treatment condition (drug + concentration + cell line).
 
-    drug: str
+    Provides access to:
+    - Drug metadata (MOA, targets, SMILES)
+    - Cell line metadata (driver mutations, organ)
+    - Pathway activities (lazy loaded on first access)
+    """
+
+    drug: Drug
     concentration: float
-    cell_line: str
+    cell_line: CellLine
     concentration_unit: str = "uM"
 
+    # internal - lazy loaded pathway activities
+    _pathway_activities: pd.DataFrame | None = field(default=None, repr=False)
+    _reactome_cache_dir: Path | None = field(default=None, repr=False)
+
     def __str__(self) -> str:
-        return f"{self.drug}_{self.concentration}{self.concentration_unit}_{self.cell_line}"
+        return f"{self.drug.name}_{self.concentration}{self.concentration_unit}_{self.cell_line.name}"
+
+    def _round_concentration(self, concentration: float) -> float:
+        """Round concentration to 1 decimal place to avoid float precision issues."""
+        return round(concentration, 1)
+
+    def _get_cache_path(self) -> Path:
+        """Get path to cached enrichment results."""
+        cache_dir = self._reactome_cache_dir or REACTOME_CACHE_DIR
+        safe_drug = self.drug.name.replace("/", "_").replace(" ", "_")
+        rounded_conc = self._round_concentration(self.concentration)
+        return cache_dir / self.cell_line.name / f"{safe_drug}_{rounded_conc}.parquet"
+
+    def _load_pathway_activities(self) -> None:
+        """Load pathway activities from cache."""
+        cache_path = self._get_cache_path()
+        if cache_path.exists():
+            self._pathway_activities = pd.read_parquet(cache_path)
+        else:
+            # return empty DataFrame if no cached pathway activities
+            self._pathway_activities = pd.DataFrame(
+                columns=['pathway', 'nes', 'pvalue', 'fdr', 'leading_edge', 'drug', 'concentration', 'cell_line']
+            )
+
+    @property
+    def pathway_activities(self) -> pd.DataFrame:
+        """
+        Lazy load pathway activities on first access.
+
+        Returns DataFrame with columns: pathway, nes, pvalue, fdr, leading_edge
+        """
+        if self._pathway_activities is None:
+            self._load_pathway_activities()
+        return self._pathway_activities
+
+    def get_pathway(self, pathway_name: str) -> pd.Series | None:
+        """
+        Get pathway activity for a specific pathway (case-insensitive partial match).
+
+        Args:
+            pathway_name: Pathway name or partial name to search for
+
+        Returns:
+            Series with pathway data, or None if not found
+        """
+        df = self.pathway_activities
+        if df.empty:
+            return None
+        mask = df['pathway'].str.contains(pathway_name, case=False, na=False)
+        matches = df[mask]
+        if len(matches) == 0:
+            return None
+        return matches.iloc[0]
+
+    def get_significant_pathways(self, fdr_threshold: float = 0.05) -> pd.DataFrame:
+        """
+        Get pathways with FDR below threshold, sorted by |NES|.
+
+        Args:
+            fdr_threshold: FDR q-value threshold (default 0.05)
+
+        Returns:
+            DataFrame with significant pathways
+        """
+        df = self.pathway_activities
+        if df.empty:
+            return df
+        significant = df[df['fdr'] < fdr_threshold].copy()
+        significant['abs_nes'] = significant['nes'].abs()
+        return significant.sort_values('abs_nes', ascending=False).drop(columns=['abs_nes'])
+
+    def get_top_activated(self, n: int = 10) -> pd.DataFrame:
+        """
+        Get top N activated pathways (highest positive NES).
+
+        Args:
+            n: Number of pathways to return
+
+        Returns:
+            DataFrame with top activated pathways
+        """
+        df = self.pathway_activities
+        if df.empty:
+            return df
+        return df[df['nes'] > 0].nlargest(n, 'nes')
+
+    def get_top_repressed(self, n: int = 10) -> pd.DataFrame:
+        """
+        Get top N repressed pathways (most negative NES).
+
+        Args:
+            n: Number of pathways to return
+
+        Returns:
+            DataFrame with top repressed pathways
+        """
+        df = self.pathway_activities
+        if df.empty:
+            return df
+        return df[df['nes'] < 0].nsmallest(n, 'nes')
 
 
 @dataclass
@@ -254,6 +412,10 @@ class L2LData:
     # cached lookups
     _valid_drugs: set[str] | None = field(default=None, repr=False)
     _valid_cell_lines: set[str] | None = field(default=None, repr=False)
+
+    # cached metadata objects (built on demand)
+    _cell_lines: dict[str, CellLine] | None = field(default=None, repr=False)
+    _drugs: dict[str, Drug] | None = field(default=None, repr=False)
 
     # duckdb connection
     _conn: duckdb.DuckDBPyConnection | None = field(default=None, repr=False)
@@ -795,6 +957,181 @@ class L2LData:
         index = self.load_treatment_index()
         mask = index['cell_line'] == cell_line
         return index[mask][['drug', 'concentration']].drop_duplicates()
+
+    # -------------------------------------------------------------------------
+    # Queryable data class API
+    # -------------------------------------------------------------------------
+
+    def _build_cell_lines(self) -> dict[str, CellLine]:
+        """
+        Build CellLine objects from cell_line_metadata (long format).
+
+        The cell line metadata is in long format with one row per driver mutation.
+        This method groups by cell_name and aggregates all mutations into a list.
+        """
+        cell_lines = {}
+
+        # group metadata by cell_name
+        for cell_name, group in self.cell_line_metadata.groupby('cell_name'):
+            # get organ (same for all rows of a cell line)
+            organ = group['Organ'].iloc[0]
+
+            # build driver mutations list
+            mutations = []
+            for _, row in group.iterrows():
+                # skip rows without driver gene info
+                if pd.isna(row.get('Driver_Gene_Symbol')):
+                    continue
+
+                mutation = DriverMutation(
+                    gene_symbol=row['Driver_Gene_Symbol'],
+                    protein_effect=row.get('Driver_ProtEffect_or_CdnaEffect') if pd.notna(row.get('Driver_ProtEffect_or_CdnaEffect')) else None,
+                    var_type=row.get('Driver_VarType', 'Unknown'),
+                    var_zygosity=row.get('Driver_VarZyg') if pd.notna(row.get('Driver_VarZyg')) else None,
+                    mechanism=row.get('Driver_Mech_InferDM') if pd.notna(row.get('Driver_Mech_InferDM')) else None,
+                    gene_type=row.get('Driver_GeneType_DM', 'Unknown'),
+                )
+                mutations.append(mutation)
+
+            cell_lines[cell_name] = CellLine(
+                name=cell_name,
+                organ=organ,
+                driver_mutations=mutations,
+            )
+
+        return cell_lines
+
+    def _build_drugs(self) -> dict[str, Drug]:
+        """Build Drug objects from drug_metadata."""
+        drugs = {}
+
+        for _, row in self.drug_metadata.iterrows():
+            drug_name = row['drug']
+
+            # parse targets (comma-separated string or "None")
+            targets_raw = row.get('targets')
+            if pd.isna(targets_raw) or targets_raw == 'None' or targets_raw is None:
+                targets = None
+            else:
+                targets = [t.strip() for t in str(targets_raw).split(',')]
+
+            # parse boolean fields (stored as "yes"/"no" strings)
+            human_approved = str(row.get('human-approved', '')).lower() == 'yes'
+            clinical_trials = str(row.get('clinical-trials', '')).lower() == 'yes'
+
+            # parse optional numeric fields
+            pubchem_cid = row.get('pubchem_cid')
+            if pd.isna(pubchem_cid):
+                pubchem_cid = None
+            else:
+                pubchem_cid = int(pubchem_cid)
+
+            # parse optional string fields
+            canonical_smiles = row.get('canonical_smiles')
+            if pd.isna(canonical_smiles):
+                canonical_smiles = None
+
+            drugs[drug_name] = Drug(
+                name=drug_name,
+                targets=targets,
+                moa_broad=row.get('moa-broad', 'unclear'),
+                moa_fine=row.get('moa-fine', 'unclear'),
+                human_approved=human_approved,
+                clinical_trials=clinical_trials,
+                canonical_smiles=canonical_smiles,
+                pubchem_cid=pubchem_cid,
+            )
+
+        return drugs
+
+    def get_cell_line(self, name: str) -> CellLine:
+        """
+        Get CellLine object with driver mutations.
+
+        Args:
+            name: Cell line name (e.g., "A549")
+
+        Returns:
+            CellLine object with driver mutations and metadata
+
+        Raises:
+            ValueError: If cell line not found
+        """
+        # build cache on first access
+        if self._cell_lines is None:
+            self._cell_lines = self._build_cell_lines()
+
+        if name not in self._cell_lines:
+            similar = [c for c in self._cell_lines.keys() if name.lower() in c.lower()]
+            raise ValueError(
+                f"Cell line '{name}' not found. "
+                f"Similar: {similar[:5] if similar else 'none'}"
+            )
+
+        return self._cell_lines[name]
+
+    def get_drug(self, name: str) -> Drug:
+        """
+        Get Drug object with MOA and targets.
+
+        Args:
+            name: Drug name (e.g., "Trametinib")
+
+        Returns:
+            Drug object with MOA, targets, and chemical structure
+
+        Raises:
+            ValueError: If drug not found
+        """
+        # build cache on first access
+        if self._drugs is None:
+            self._drugs = self._build_drugs()
+
+        if name not in self._drugs:
+            similar = [d for d in self._drugs.keys() if name.lower() in d.lower()]
+            raise ValueError(
+                f"Drug '{name}' not found. "
+                f"Similar drugs: {similar[:5] if similar else 'none'}"
+            )
+
+        return self._drugs[name]
+
+    def get_treatment(
+        self,
+        drug: str,
+        concentration: float,
+        cell_line: str,
+    ) -> TreatmentCondition:
+        """
+        Create fully populated TreatmentCondition with lazy pathway loading.
+
+        Args:
+            drug: Drug name (e.g., "Trametinib")
+            concentration: Drug concentration (e.g., 0.05)
+            cell_line: Cell line name (e.g., "A549")
+
+        Returns:
+            TreatmentCondition with Drug and CellLine objects, lazy-loaded pathway activities
+
+        Raises:
+            ValueError: If drug or cell line not found
+
+        Example:
+            >>> data = L2LData()
+            >>> treatment = data.get_treatment("Trametinib", 0.05, "A549")
+            >>> print(treatment.drug.moa_fine)  # "MEK inhibitor"
+            >>> print(treatment.cell_line.has_mutation("KRAS"))  # True
+            >>> print(treatment.get_significant_pathways())  # lazy loads pathway activities
+        """
+        drug_obj = self.get_drug(drug)
+        cell_line_obj = self.get_cell_line(cell_line)
+
+        return TreatmentCondition(
+            drug=drug_obj,
+            concentration=concentration,
+            cell_line=cell_line_obj,
+            _reactome_cache_dir=REACTOME_CACHE_DIR,
+        )
 
     def close(self) -> None:
         """Close the DuckDB connection."""

@@ -194,3 +194,21 @@ Note that Step 2 contributed poorly to both scores: low S_process (poor hypothes
 | Σ S_process (across 4 steps shown) | 5.10 |
 | λ · S_progress (λ=10) | 5.0 |
 | S_episode | 10.1 |
+
+---
+
+## Implementation
+
+### Data Layer
+
+The `L2LData` class (`src/l2l_bench/l2l_data.py`) provides efficient access to Tahoe-100M via DuckDB queries against remote parquet files. A pre-built treatment index enables fast single-file lookups for specific drug/concentration/cell-line combinations.
+
+Queryable data classes encapsulate treatment metadata for agent consumption:
+- `Drug`: name, targets, MOA, SMILES, PubChem ID
+- `CellLine`: name, organ, driver mutations
+- `DriverMutation`: gene, protein effect, variant type, mechanism (GoF/LoF)
+- `TreatmentCondition`: combines drug + cell line + concentration with lazy-loaded pathway activities
+
+Factory methods (`get_drug()`, `get_cell_line()`, `get_treatment()`) construct these objects from the underlying metadata.
+
+Pathway enrichment scores are pre-computed using GSEApy prerank with Reactome pathways and cached per treatment condition. The `TreatmentCondition` class lazy-loads these on first access and provides query methods (`get_significant_pathways()`, `get_top_activated()`, etc.).
