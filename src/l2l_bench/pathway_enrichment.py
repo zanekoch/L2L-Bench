@@ -34,13 +34,18 @@ class PathwayEnrichment:
     def __post_init__(self):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def _round_concentration(self, concentration: float) -> float:
+        """Round concentration to 1 decimal place to avoid float precision issues."""
+        return round(concentration, 1)
+
     def _get_cache_path(self, drug: str, concentration: float, cell_line: str) -> Path:
         """Get path to cached enrichment results."""
         # sanitize drug name for filesystem
         safe_drug = drug.replace("/", "_").replace(" ", "_")
+        rounded_conc = self._round_concentration(concentration)
         cell_dir = self.cache_dir / cell_line
         cell_dir.mkdir(parents=True, exist_ok=True)
-        return cell_dir / f"{safe_drug}_{concentration}.parquet"
+        return cell_dir / f"{safe_drug}_{rounded_conc}.parquet"
 
     def _is_cached(self, drug: str, concentration: float, cell_line: str) -> bool:
         """Check if enrichment results are already cached."""
@@ -51,8 +56,27 @@ class PathwayEnrichment:
         return pd.read_parquet(self._get_cache_path(drug, concentration, cell_line))
 
     def _save_cache(self, df: pd.DataFrame, drug: str, concentration: float, cell_line: str) -> None:
-        """Save enrichment results to cache."""
-        df.to_parquet(self._get_cache_path(drug, concentration, cell_line), index=False)
+        """Save enrichment results to cache atomically."""
+        import os
+        import tempfile
+
+        cache_path = self._get_cache_path(drug, concentration, cell_line)
+
+        # round concentration in the saved data for consistency
+        df = df.copy()
+        if 'concentration' in df.columns:
+            df['concentration'] = self._round_concentration(concentration)
+
+        # write to temp file, then atomic rename
+        fd, temp_path = tempfile.mkstemp(suffix='.parquet.tmp', dir=cache_path.parent)
+        try:
+            os.close(fd)
+            df.to_parquet(temp_path, index=False)
+            os.replace(temp_path, cache_path)  # atomic on POSIX
+        except Exception:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
 
     def compute_enrichment_from_df(
         self,
@@ -62,6 +86,7 @@ class PathwayEnrichment:
         cell_line: str,
         force_recompute: bool = False,
         verbose: bool = True,
+        threads: int = 4,
     ) -> pd.DataFrame:
         """
         Compute Reactome pathway enrichment from pre-loaded DataFrame.
@@ -76,6 +101,7 @@ class PathwayEnrichment:
             cell_line: Cell line name
             force_recompute: If True, recompute even if cached
             verbose: If True, print progress messages
+            threads: Number of threads for GSEApy prerank (default 4, use 1 for parallel workers)
 
         Returns:
             DataFrame with columns: pathway, nes, pvalue, fdr, leading_edge
@@ -125,6 +151,7 @@ class PathwayEnrichment:
             outdir=None,  # don't save figures
             seed=42,
             verbose=False,
+            threads=threads,
         )
 
         # extract results

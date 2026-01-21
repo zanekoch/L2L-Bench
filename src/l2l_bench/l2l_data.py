@@ -27,6 +27,187 @@ def _get_root_dir() -> Path:
 INDEX_PATH = _get_root_dir() / "data/processed/treatment_index.parquet"
 
 
+def _process_file_batch(batch_info: dict) -> dict:
+    """
+    Worker function to process a batch of parquet files.
+
+    Creates its own DuckDB connection (connections aren't picklable across processes).
+    Each worker processes a list of file numbers, optionally computing GSEA for each treatment.
+
+    Args:
+        batch_info: Dict with keys:
+            - file_nums: list of file numbers to process
+            - dataset_path: HuggingFace dataset path
+            - de_config: DE config name
+            - compute_pathways: whether to compute GSEA
+            - cache_dir: path to reactome cache directory
+            - gsea_threads: threads per GSEApy call
+
+    Returns:
+        Dict with keys:
+            - treatments: list of treatment dicts
+            - pathways_computed: count of pathways computed
+            - pathways_skipped: count of pathways skipped (cached)
+            - errors: list of error messages
+    """
+    import os
+
+    file_nums = batch_info['file_nums']
+    dataset_path = batch_info['dataset_path']
+    de_config = batch_info['de_config']
+    compute_pathways = batch_info['compute_pathways']
+    cache_dir = Path(batch_info['cache_dir']) if batch_info.get('cache_dir') else None
+    gsea_threads = batch_info.get('gsea_threads', 1)
+
+    # create worker's own DuckDB connection
+    conn = duckdb.connect()
+    conn.execute("INSTALL httpfs; LOAD httpfs;")
+    conn.execute("SET http_timeout=30000;")
+
+    # configure HuggingFace authentication if token available
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        conn.execute(f"""
+            CREATE SECRET hf_auth (
+                TYPE http,
+                BEARER_TOKEN '{hf_token}'
+            );
+        """)
+
+    # initialize pathway enrichment if needed
+    pe = None
+    if compute_pathways and cache_dir:
+        # import here to avoid circular imports
+        from l2l_bench.pathway_enrichment import PathwayEnrichment
+
+        # create minimal PathwayEnrichment without full L2LData
+        # use object.__new__ to bypass __init__ which needs L2LData
+        pe = object.__new__(PathwayEnrichment)
+        pe.cache_dir = cache_dir
+        pe.cache_dir.mkdir(parents=True, exist_ok=True)
+        pe.gene_set_library = "Reactome_2022"
+        pe.min_size = 15
+        pe.max_size = 500
+        pe.permutation_num = 1000
+
+    treatments = []
+    pathways_computed = 0
+    pathways_skipped = 0
+    errors = []
+
+    def round_concentration(conc: float) -> float:
+        """Round concentration to 1 decimal place."""
+        return round(conc, 1)
+
+    for file_num in file_nums:
+        base_url = f"https://huggingface.co/datasets/{dataset_path}/resolve/main/metadata/{de_config}"
+        url = f"{base_url}/train-{file_num:05d}-of-01026.parquet"
+
+        # retry loop with exponential backoff for rate limiting (HTTP 429)
+        import time as time_module
+        max_retries = 5
+        base_wait = 60  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                if compute_pathways and pe is not None:
+                    # load columns needed for index + GSEA
+                    query = f"""
+                        SELECT Cell_Name_Vevo, drug, concentration,
+                               gene_name, log2FoldChange, padj
+                        FROM read_parquet('{url}')
+                    """
+                    full_de = conn.execute(query).df()
+
+                    # round concentration values to avoid float precision issues
+                    full_de['concentration'] = full_de['concentration'].apply(round_concentration)
+
+                    # extract distinct treatments
+                    df = full_de[['Cell_Name_Vevo', 'drug', 'concentration']].drop_duplicates()
+                    df = df.rename(columns={'Cell_Name_Vevo': 'cell_line'})
+
+                    for _, row in df.iterrows():
+                        treatments.append({
+                            'cell_line': row['cell_line'],
+                            'drug': row['drug'],
+                            'concentration': row['concentration'],
+                            'file_num': file_num,
+                        })
+
+                    # process each treatment for GSEA
+                    for (cell_line, drug, conc), treatment_df in full_de.groupby(
+                        ['Cell_Name_Vevo', 'drug', 'concentration']
+                    ):
+                        # skip if already cached
+                        if pe._is_cached(drug, conc, cell_line):
+                            pathways_skipped += 1
+                            continue
+
+                        try:
+                            pe.compute_enrichment_from_df(
+                                de_data=treatment_df,
+                                drug=drug,
+                                concentration=conc,
+                                cell_line=cell_line,
+                                verbose=False,
+                                threads=gsea_threads,
+                            )
+                            pathways_computed += 1
+                        except Exception as e:
+                            err_msg = f"Pathway {drug}@{conc} in {cell_line}: {e}"
+                            print(f"  [Worker] ERROR: {err_msg}", flush=True)
+                            errors.append(err_msg)
+
+                else:
+                    # index-only mode: just get distinct treatments
+                    query = f"""
+                        SELECT DISTINCT
+                            Cell_Name_Vevo as cell_line,
+                            drug,
+                            concentration
+                        FROM read_parquet('{url}')
+                    """
+                    df = conn.execute(query).df()
+
+                    # round concentration values
+                    df['concentration'] = df['concentration'].apply(round_concentration)
+
+                    for _, row in df.iterrows():
+                        treatments.append({
+                            'cell_line': row['cell_line'],
+                            'drug': row['drug'],
+                            'concentration': row['concentration'],
+                            'file_num': file_num,
+                        })
+
+                # success - break out of retry loop
+                break
+
+            except Exception as e:
+                err_str = str(e)
+                is_rate_limit = '429' in err_str
+
+                if is_rate_limit and attempt < max_retries - 1:
+                    wait_time = base_wait * (2 ** attempt)  # 60, 120, 240, 480, 960
+                    print(f"  [Worker] File {file_num}: Rate limited (429), waiting {wait_time}s before retry {attempt + 2}/{max_retries}...", flush=True)
+                    time_module.sleep(wait_time)
+                else:
+                    # not a rate limit error, or max retries exhausted
+                    err_msg = f"File {file_num}: {e}"
+                    print(f"  [Worker] ERROR: {err_msg}", flush=True)
+                    errors.append(err_msg)
+                    break
+
+    conn.close()
+
+    return {
+        'treatments': treatments,
+        'pathways_computed': pathways_computed,
+        'pathways_skipped': pathways_skipped,
+        'errors': errors,
+    }
+
+
 @dataclass
 class TreatmentCondition:
     """Represents a specific treatment condition (drug + concentration + cell line)."""
@@ -381,170 +562,164 @@ class L2LData:
         self,
         save_path: Path | None = None,
         compute_pathways: bool = False,
+        n_workers: int | None = None,
+        batch_size: int = 50,
     ) -> pd.DataFrame:
         """
         Build index mapping treatments to file numbers using DuckDB.
 
-        Queries SELECT DISTINCT from each parquet file individually.
-        Takes ~3-6 hours (10-20 sec per file × 1026 files).
+        Uses parallel workers to process files concurrently. Each worker creates
+        its own DuckDB connection and processes a batch of files.
 
         When compute_pathways=True, also computes GSEA pathway enrichment for each
-        treatment while processing each file. This avoids a second pass through all
-        files but significantly increases processing time per file (~10-30 min/file).
+        treatment while processing each file. Results are cached atomically.
 
-        Writes incrementally to disk and can resume from where it left off.
-        The index is saved to data/processed/treatment_index.parquet.
+        Supports resume: reads existing index and skips already-processed files.
 
         Args:
             save_path: Path to save the index. Defaults to INDEX_PATH.
             compute_pathways: If True, compute GSEA pathway enrichment for each
                 treatment while processing. Results are cached to
                 data/processed/reactome/ and already-cached treatments are skipped.
+            n_workers: Number of parallel workers. Defaults to cpu_count() - 1.
+            batch_size: Number of files per worker task. Default 50.
 
         Returns:
             DataFrame with columns: cell_line, drug, concentration, file_num
         """
         import time
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
         if save_path is None:
             save_path = INDEX_PATH
 
         n_files = 1026
 
-        # initialize PathwayEnrichment if computing pathways
-        pe = None
-        if compute_pathways:
-            from l2l_bench.pathway_enrichment import PathwayEnrichment
-            pe = PathwayEnrichment(self)
-            print("Pathway enrichment enabled - will compute GSEA for each treatment")
+        # determine number of workers
+        if n_workers is None:
+            n_workers = max(1, os.cpu_count() - 1)
+
+        # set GSEA threads: use 1 when parallel to avoid CPU oversubscription
+        gsea_threads = 1 if n_workers > 1 else 4
 
         # check for existing partial index to resume from
-        start_file = 0
+        processed_files = set()
         all_treatments = []
         if save_path.exists():
             existing_df = pd.read_parquet(save_path)
             if 'file_num' in existing_df.columns:
-                start_file = existing_df['file_num'].max() + 1
+                processed_files = set(existing_df['file_num'].unique())
                 all_treatments.append(existing_df)
-                print(f"Resuming from file {start_file} (found {len(existing_df)} existing treatments)")
+                print(f"Resuming: found {len(existing_df)} existing treatments from {len(processed_files)} files")
 
-        if start_file >= n_files:
+        # determine files still needing processing
+        remaining_files = [f for f in range(n_files) if f not in processed_files]
+
+        if not remaining_files:
             print("Index already complete!")
             return existing_df
 
-        print(f"Building treatment index via DuckDB ({n_files} files)...")
-        if start_file == 0 and not compute_pathways:
-            print("Estimated time: 3-6 hours (10-20 sec per file)")
+        print(f"Building treatment index ({len(remaining_files)} files remaining, {n_workers} workers)...")
+        if compute_pathways:
+            print("Pathway enrichment enabled - will compute GSEA for each treatment")
+
+        # prepare cache directory for pathway enrichment
+        cache_dir = _get_root_dir() / "data/processed/reactome" if compute_pathways else None
+
+        # create batches
+        batches = []
+        for i in range(0, len(remaining_files), batch_size):
+            batch_files = remaining_files[i:i + batch_size]
+            batches.append({
+                'file_nums': batch_files,
+                'dataset_path': self.dataset_path,
+                'de_config': self.de_config,
+                'compute_pathways': compute_pathways,
+                'cache_dir': str(cache_dir) if cache_dir else None,
+                'gsea_threads': gsea_threads,
+            })
+
+        print(f"Created {len(batches)} batches of up to {batch_size} files each")
 
         start_time = time.time()
-        files_processed = 0
-        pathways_computed = 0
-        pathways_skipped = 0
+        total_pathways_computed = 0
+        total_pathways_skipped = 0
+        all_errors = []
+        batches_completed = 0
 
-        for file_num in range(start_file, n_files):
-            file_start = time.time()
-            url = self._get_single_parquet_url(file_num)
+        # process batches in parallel
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            # submit all batches
+            future_to_batch = {
+                executor.submit(_process_file_batch, batch): batch
+                for batch in batches
+            }
 
-            try:
-                # compute pathways if enabled
-                file_pathways_computed = 0
-                file_pathways_skipped = 0
+            # process results as they complete
+            for future in as_completed(future_to_batch):
+                batch = future_to_batch[future]
+                batch_files = batch['file_nums']
 
-                if compute_pathways and pe is not None:
-                    # load only columns needed for index + GSEA
-                    # index: Cell_Name_Vevo, drug, concentration
-                    # GSEA: gene_name, log2FoldChange, padj
-                    query = f"""
-                        SELECT Cell_Name_Vevo, drug, concentration,
-                               gene_name, log2FoldChange, padj
-                        FROM read_parquet('{url}')
-                    """
-                    full_de = self._conn.execute(query).df()
+                try:
+                    result = future.result()
 
-                    # extract distinct treatments from loaded data (no second download)
-                    df = full_de[['Cell_Name_Vevo', 'drug', 'concentration']].drop_duplicates()
-                    df = df.rename(columns={'Cell_Name_Vevo': 'cell_line'})
-                    df['file_num'] = file_num
-                    all_treatments.append(df)
-                    files_processed += 1
+                    # collect treatments
+                    if result['treatments']:
+                        batch_df = pd.DataFrame(result['treatments'])
+                        all_treatments.append(batch_df)
 
-                    # process each treatment in the file
-                    for (cell_line, drug, conc), treatment_df in full_de.groupby(
-                        ['Cell_Name_Vevo', 'drug', 'concentration']
-                    ):
-                        # skip if already cached
-                        if pe._is_cached(drug, conc, cell_line):
-                            file_pathways_skipped += 1
-                            continue
+                    total_pathways_computed += result['pathways_computed']
+                    total_pathways_skipped += result['pathways_skipped']
+                    all_errors.extend(result['errors'])
+                    batches_completed += 1
 
-                        try:
-                            pe.compute_enrichment_from_df(
-                                de_data=treatment_df,
-                                drug=drug,
-                                concentration=conc,
-                                cell_line=cell_line,
-                                verbose=False,  # reduce noise during batch processing
-                            )
-                            file_pathways_computed += 1
-                        except Exception as e:
-                            print(f"    Warning: Failed pathway for {drug}@{conc} in {cell_line}: {e}")
+                    # progress report
+                    elapsed = time.time() - start_time
+                    files_done = len(processed_files) + sum(
+                        len(b['file_nums']) for b in [future_to_batch[f]
+                        for f in future_to_batch if f.done()]
+                    )
+                    files_remaining = n_files - files_done
+                    eta_sec = (elapsed / max(1, batches_completed)) * (len(batches) - batches_completed)
 
-                    pathways_computed += file_pathways_computed
-                    pathways_skipped += file_pathways_skipped
-                else:
-                    # index-only mode: just get distinct treatments
-                    query = f"""
-                        SELECT DISTINCT
-                            Cell_Name_Vevo as cell_line,
-                            drug,
-                            concentration
-                        FROM read_parquet('{url}')
-                    """
-                    df = self._conn.execute(query).df()
-                    df['file_num'] = file_num
-                    all_treatments.append(df)
-                    files_processed += 1
+                    progress_msg = (
+                        f"  Batch {batches_completed}/{len(batches)} done "
+                        f"(files {batch_files[0]}-{batch_files[-1]}) | "
+                        f"ETA: {eta_sec/3600:.1f}h"
+                    )
+                    if compute_pathways:
+                        progress_msg += f" | pathways: {result['pathways_computed']} new, {result['pathways_skipped']} cached"
+                    print(progress_msg)
 
-                file_elapsed = time.time() - file_start
-                total_elapsed = time.time() - start_time
-                avg_per_file = total_elapsed / files_processed
-                remaining_files = n_files - file_num - 1
-                eta_sec = avg_per_file * remaining_files
-
-                # build progress message
-                progress_msg = (
-                    f"  File {file_num + 1:4d}/{n_files} | "
-                    f"{len(df):5d} treatments | "
-                    f"{file_elapsed:5.1f}s | "
-                    f"ETA: {eta_sec/3600:.1f}h"
-                )
-                if compute_pathways:
-                    progress_msg += f" | pathways: {file_pathways_computed} new, {file_pathways_skipped} cached"
-                print(progress_msg)
-
-                # save incrementally after every file
-                self._save_treatment_index(all_treatments, save_path)
-
-            except Exception as e:
-                print(f"  File {file_num + 1:4d}/{n_files} | ERROR: {e}")
-                # save what we have before continuing
-                if all_treatments:
+                    # save incrementally after each batch
                     self._save_treatment_index(all_treatments, save_path)
-                continue
+
+                except Exception as e:
+                    print(f"  Batch (files {batch_files[0]}-{batch_files[-1]}) FAILED: {e}")
+                    all_errors.append(f"Batch {batch_files[0]}-{batch_files[-1]}: {e}")
 
         # final save
         index_df = self._save_treatment_index(all_treatments, save_path)
 
         total_elapsed = time.time() - start_time
-        print(f"\nDone! Processed {files_processed} files in {total_elapsed/3600:.1f} hours")
+        print(f"\nDone! Processed {len(remaining_files)} files in {total_elapsed/3600:.2f} hours")
         print(f"Saved {len(index_df)} unique treatments to {save_path}")
         if compute_pathways:
-            print(f"Pathways: {pathways_computed} computed, {pathways_skipped} already cached")
+            print(f"Pathways: {total_pathways_computed} computed, {total_pathways_skipped} already cached")
+
+        if all_errors:
+            print(f"\nWarning: {len(all_errors)} errors occurred:")
+            for err in all_errors[:10]:  # show first 10
+                print(f"  - {err}")
+            if len(all_errors) > 10:
+                print(f"  ... and {len(all_errors) - 10} more")
 
         return index_df
 
     def _save_treatment_index(self, all_treatments: list[pd.DataFrame], save_path: Path) -> pd.DataFrame:
-        """Combine and save treatment index, deduplicating entries."""
+        """Combine and save treatment index atomically, deduplicating entries."""
+        import tempfile
+
         index_df = pd.concat(all_treatments, ignore_index=True)
 
         # deduplicate - same treatment may appear in multiple files, keep first
@@ -554,7 +729,18 @@ class L2LData:
         )
 
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        index_df.to_parquet(save_path, index=False)
+
+        # write to temp file, then atomic rename
+        fd, temp_path = tempfile.mkstemp(suffix='.parquet.tmp', dir=save_path.parent)
+        try:
+            os.close(fd)
+            index_df.to_parquet(temp_path, index=False)
+            os.replace(temp_path, save_path)  # atomic on POSIX
+        except Exception:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
+
         return index_df
 
     def load_treatment_index(self) -> pd.DataFrame:
