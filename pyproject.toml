@@ -15,9 +15,13 @@ dependencies = [
     "ipykernel>=6.0.0",
     "openpyxl>=3.1.5",
     "python-dotenv>=1.0.0",
+    "fhaviary>=0.5.0",
+    "ldp>=0.1.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
 ]
