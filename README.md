@@ -209,3 +209,46 @@ Queryable data classes encapsulate treatment metadata for agent consumption:
 Factory methods (`get_drug()`, `get_cell_line()`, `get_treatment()`) construct these objects from the underlying metadata.
 
 Pathway enrichment scores are pre-computed using GSEApy prerank with Reactome pathways and cached per treatment condition. The `TreatmentCondition` class lazy-loads these on first access and provides query methods (`get_significant_pathways()`, `get_top_activated()`, etc.).
+
+### Episode Structure
+
+The `Question` class (`src/l2l_bench/question.py`) represents a benchmark episode with its held-out test set:
+
+```python
+@dataclass
+class Question:
+    question: str                    # mechanistic "why" question
+    target_pathway: str              # exact Reactome pathway name
+    drug: str                        # drug being investigated
+    concentration: float             # drug concentration
+    positive_class_direction: Literal['activated', 'repressed', 'either']
+    test_set: list[TestItem]         # held-out test items with ground truth
+    fdr_threshold: float = 0.05
+```
+
+Each `TestItem` wraps a treatment with its ground truth label:
+
+```python
+@dataclass
+class TestItem:
+    treatment: TreatmentCondition
+    ground_truth: bool      # True if pathway shows significant activity in expected direction
+    pathway_nes: float      # actual NES score
+    pathway_fdr: float      # actual FDR value
+```
+
+The `Question.from_drug_response()` factory method auto-discovers all eligible treatments:
+
+```python
+question = Question.from_drug_response(
+    data=data,
+    question="What determines if a cell line shows MAPK6/MAPK4 inhibition by Dabrafenib?",
+    drug="Dabrafenib",
+    concentration=5.0,
+    target_pathway="MAPK6/MAPK4 Signaling R-HSA-5687128",
+    positive_class_direction="repressed",
+    fdr_threshold=0.05
+)
+```
+
+This scans the reactome cache to find all cell lines treated with the specified drug/concentration that have pathway data for the target pathway, then computes ground truth based on NES direction and FDR threshold.
